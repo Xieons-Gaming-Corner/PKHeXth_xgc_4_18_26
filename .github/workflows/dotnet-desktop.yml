@@ -1,3 +1,4 @@
+text
 name: .NET Build
 
 on:
@@ -27,7 +28,7 @@ jobs:
     - name: Setup .NET
       uses: actions/setup-dotnet@v4
       with:
-        dotnet-version: 8.0.x
+        dotnet-version: 9.0.x
 
     - name: Restore solution
       run: dotnet restore $env:Solution_Name
@@ -36,4 +37,16 @@ jobs:
       run: dotnet build $env:Solution_Name --configuration $env:Configuration --no-restore
 
     - name: Test solution
-      run: dotnet test $env:Solution_Name --configuration $env:Configuration --no-build
+      run: >
+        dotnet test $env:Solution_Name
+        --configuration $env:Configuration
+        --no-build
+        --logger "trx;LogFileName=test-results-${{ matrix.configuration }}.trx"
+        --results-directory TestResults
+
+    - name: Upload test results
+      if: success() || failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: test-results-${{ matrix.configuration }}
+        path: TestResults/*.trx
