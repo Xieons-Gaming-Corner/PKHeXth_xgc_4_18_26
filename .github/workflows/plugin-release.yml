@@ -1,3 +1,6 @@
+Here’s the final workflow file. It fixes the cross-job output issue, avoids passing a temp-file path between jobs, rebuilds the release notes in the release job, uses uploaded artifacts correctly, and keeps everything on GITHUB_TOKEN only. Creating releases requires contents: write, and passing values between jobs must use explicit job outputs rather than step-local paths.
+
+text
 name: Auto-Release
 
 on:
@@ -12,11 +15,19 @@ on:
       - 'wild/**'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  build-and-release:
+  build:
     runs-on: windows-latest
+    outputs:
+      should_release: ${{ steps.detect_changes.outputs.SHOULD_RELEASE }}
+      is_version_update: ${{ steps.detect_changes.outputs.IS_VERSION_UPDATE }}
+      is_legality_update: ${{ steps.detect_changes.outputs.IS_LEGALITY_UPDATE }}
+      is_plugin_update: ${{ steps.detect_changes.outputs.IS_PLUGIN_UPDATE }}
+      release_version: ${{ steps.release_meta.outputs.RELEASE_VERSION }}
+      release_title: ${{ steps.release_meta.outputs.RELEASE_TITLE }}
+      release_kind: ${{ steps.release_meta.outputs.RELEASE_KIND }}
 
     env:
       GH_TOKEN: ${{ github.token }}
@@ -106,69 +117,46 @@ jobs:
 
           if ($isVersionUpdate -eq "True" -and -not $baseVersionExists) {
             $releaseVersion = $baseVersion
-            $releaseExists = $false
+            $releaseKind = "base"
             Write-Host "Creating new base release: $releaseVersion"
           }
           elseif ($baseVersionExists) {
             $newRevision = $latestRevision + 1
             $releaseVersion = "$baseVersion-rev.$newRevision"
-            $releaseExists = $false
+            if ($isLegalityUpdate -eq "True") {
+              $releaseKind = "legality"
+            }
+            elseif ($isPluginUpdate -eq "True") {
+              $releaseKind = "plugin"
+            }
+            else {
+              $releaseKind = "revision"
+            }
             Write-Host "Creating revision release: $releaseVersion"
           }
           else {
             $releaseVersion = $baseVersion
-            $releaseExists = $false
+            $releaseKind = "base"
             Write-Host "Creating initial release: $releaseVersion"
           }
 
-          if ($releaseVersion -like "*-rev.*") {
-            if ($isLegalityUpdate -eq "True") {
-              $releaseTitle = "v$releaseVersion - Legality Update"
-              $releaseNotes = @"
-## Legality Database Update
-
-- Updated legality resources
-- PKHeX.exe has been updated
-- PKHeX.Core.dll has been updated
-
-*This is a revision release for legality updates.*
-"@
-            }
-            else {
-              $releaseTitle = "v$releaseVersion - Plugin Update"
-              $releaseNotes = @"
-## Plugin Updates
-
-- Updated plugin resources
-- PKHeX.exe has been updated
-- PKHeX.Core.dll has been updated
-
-*This is a revision release for plugin updates.*
-"@
-            }
+          if ($releaseKind -eq "legality") {
+            $releaseTitle = "v$releaseVersion - Legality Update"
+          }
+          elseif ($releaseKind -eq "plugin") {
+            $releaseTitle = "v$releaseVersion - Plugin Update"
           }
           else {
             $releaseTitle = "v$releaseVersion"
-            $releaseNotes = @"
-## Release v$releaseVersion
-
-- PKHeX.exe has been updated
-- PKHeX.Core.dll has been updated
-
-*New version release.*
-"@
           }
 
           "RELEASE_VERSION=$releaseVersion" >> $env:GITHUB_OUTPUT
-          "RELEASE_EXISTS=$releaseExists" >> $env:GITHUB_OUTPUT
           "RELEASE_TITLE=$releaseTitle" >> $env:GITHUB_OUTPUT
-
-          $releaseNotesPath = Join-Path $env:RUNNER_TEMP "release_notes.md"
-          $releaseNotes | Out-File -FilePath $releaseNotesPath -Encoding utf8
-          "RELEASE_NOTES_PATH=$releaseNotesPath" >> $env:GITHUB_OUTPUT
+          "RELEASE_KIND=$releaseKind" >> $env:GITHUB_OUTPUT
 
           Write-Host "Final release version: $releaseVersion"
           Write-Host "Release title: $releaseTitle"
+          Write-Host "Release kind: $releaseKind"
 
       - name: Restore dependencies
         if: steps.detect_changes.outputs.SHOULD_RELEASE == 'True'
@@ -198,17 +186,89 @@ jobs:
             throw "PKHeX.Core.dll not found in PKHeX.Core/bin/Release/net9.0/PKHeX.Core.dll"
           }
 
-      - name: Create release
+      - name: Upload artifacts
         if: steps.detect_changes.outputs.SHOULD_RELEASE == 'True'
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets
+          path: |
+            publish/PKHeX.exe
+            PKHeX.Core/bin/Release/net9.0/PKHeX.Core.dll
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    runs-on: windows-latest
+    needs: build
+    if: needs.build.outputs.should_release == 'True'
+    permissions:
+      contents: write
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-assets
+          path: release-assets
+
+      - name: Create release notes
+        id: notes
         shell: pwsh
         run: |
-          $version = "${{ steps.release_meta.outputs.RELEASE_VERSION }}"
-          $title = "${{ steps.release_meta.outputs.RELEASE_TITLE }}"
-          $notesPath = "${{ steps.release_meta.outputs.RELEASE_NOTES_PATH }}"
+          $releaseKind = "${{ needs.build.outputs.release_kind }}"
+          $releaseVersion = "${{ needs.build.outputs.release_version }}"
+          $notesPath = Join-Path $env:RUNNER_TEMP "release_notes.md"
+
+          if ($releaseKind -eq "legality") {
+            $releaseNotes = @"
+## Legality Database Update
+
+- Updated legality resources
+- PKHeX.exe has been updated
+- PKHeX.Core.dll has been updated
+
+*This is a revision release for legality updates.*
+"@
+          }
+          elseif ($releaseKind -eq "plugin") {
+            $releaseNotes = @"
+## Plugin Updates
+
+- Updated plugin resources
+- PKHeX.exe has been updated
+- PKHeX.Core.dll has been updated
+
+*This is a revision release for plugin updates.*
+"@
+          }
+          else {
+            $releaseNotes = @"
+## Release v$releaseVersion
+
+- PKHeX.exe has been updated
+- PKHeX.Core.dll has been updated
+
+*New version release.*
+"@
+          }
+
+          $releaseNotes | Out-File -FilePath $notesPath -Encoding utf8
+          "NOTES_PATH=$notesPath" >> $env:GITHUB_OUTPUT
+
+      - name: Create release
+        shell: pwsh
+        run: |
+          $version = "${{ needs.build.outputs.release_version }}"
+          $title = "${{ needs.build.outputs.release_title }}"
+          $notesPath = "${{ steps.notes.outputs.NOTES_PATH }}"
 
           Write-Host "Creating new release $version"
+
           gh release create $version `
-            "publish/PKHeX.exe" `
-            "PKHeX.Core/bin/Release/net9.0/PKHeX.Core.dll" `
+            "release-assets/PKHeX.exe" `
+            "release-assets/PKHeX.Core.dll" `
             --title "$title" `
             --notes-file "$notesPath"
